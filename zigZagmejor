@@ -1,0 +1,235 @@
+#------------------------------------------------------------------------------#
+#---------------------------Vision-based Steering------------------------------#
+#------------------------------------------------------------------------------#
+# Implements a steering controller for a differential-drive robot
+# to follow a line detected from a downward facing camera
+
+#===============================================================================
+#region: Python imports
+#-------------------------------------------------------------------------------
+import cv2
+import os
+import sys
+import subprocess
+import numpy as np
+from pal.utilities.probe import Probe
+from pal.utilities.timing import Timer
+from pal.products.sensors import SensorsCamera, SensorsDisplay, SensorsTrainer
+from pal.products.actuators import ActuatorsTrainer
+
+# imports from parent directory
+parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(parent_path)
+from mobile_robot_functions import MDLVision, MDLDisplayFormat, \
+    MDLMovement, MDLObstacle
+# endregion
+
+#===============================================================================
+#region: Initialize constants and variables
+#-------------------------------------------------------------------------------
+TOTAL_RUNTIME = 3000 
+FRAME_RATE = 30
+MAIN_LOOP_RATE = 90
+IMAGE_SIZE = [640,480]
+
+# Ajuste del encoder a 1024 pulsos reales de tu chasis
+ENC_RATIO = 2*np.pi/1024 
+
+# Tolerancia de frames perdidos antes de asumir fin de pista (15 frames = 0.5s a 30 FPS)
+MAX_LOST_FRAMES = 15
+lost_line_frames = 0
+
+sampleCount, frameCount = 0, 0 
+centroid_loc = np.array([0,0], dtype=int)
+x, y, w, h = 0,0,0,0
+steerError = 0
+leftWheelPos, rightWheelPos = 0, 0
+leftWheelSpd, rightWheelSpd = 0, 0
+fwdSpdCmd, turnSpdCmd= 0, 0
+leftSpdCmd, rightSpdCmd = 0, 0
+obstacleDetected = False
+#endregion
+
+#===============================================================================
+#region: Scope setup 
+#-------------------------------------------------------------------------------
+probe = Probe(ip = 'localhost')
+probe.add_scope(numSignals = 2, name = 'Motor Position')
+probe.add_scope(numSignals = 2, name = 'Motor Velocity')
+probe.add_scope(numSignals = 2, name = 'Angles' )
+
+subprocess.Popen(
+    [sys.executable, 
+     os.path.join(os.path.dirname(__file__), 'observer_steering.py')],
+    cwd=os.path.dirname(__file__))
+while not probe.connected:
+    probe.check_connection()
+# endregion
+
+#===============================================================================
+#region: Initialization
+#-------------------------------------------------------------------------------
+timer = Timer(sampleRate=MAIN_LOOP_RATE, totalTime=TOTAL_RUNTIME)
+vision = MDLVision(IMAGE_SIZE[0], IMAGE_SIZE[1])
+display = MDLDisplayFormat(IMAGE_SIZE[0], IMAGE_SIZE[1])
+
+# Llantas ajustadas a 68 mm de radio y distancia entre ellas de 12 cm
+movement = MDLMovement(whRadius = 0.068, whDist = 0.12)
+obstacle = MDLObstacle()
+
+line2SpdMap_mdl = movement.error_to_turn_cmd(sampleTime=1/FRAME_RATE, 
+                                             saturation = 2*np.pi)
+next(line2SpdMap_mdl)
+
+with (SensorsCamera(frameWidth = IMAGE_SIZE[0],
+                    frameHeight = IMAGE_SIZE[1],
+                    frameRate = FRAME_RATE,
+                    cameraID = 0) as camera, 
+        ActuatorsTrainer(block = 3) as leftMotor,
+        ActuatorsTrainer(block = 1) as rightMotor, 
+        SensorsDisplay() as lcd,
+        SensorsTrainer() as sensors):
+
+    leftMotor.enable_motors()
+    rightMotor.enable_motors()
+#endregion
+
+    while timer.check():
+
+        currentTime = timer.get_current_time()
+
+        #=======================================================================
+        #region: Update motor commands 
+        #-----------------------------------------------------------------------
+        (leftSpdCmd, rightSpdCmd) = movement.inverse_velocity_kinematics(fwdSpdCmd,  
+                                                                         turnSpdCmd)
+
+        if obstacleDetected:
+            leftSpdCmd = 0
+            rightSpdCmd = 0
+        
+        leftMotor.update_dc(-leftSpdCmd, limitCmd=False) 
+        rightMotor.update_dc(rightSpdCmd, limitCmd=False) 
+        leftMotor.write_motors()
+        rightMotor.write_motors()
+
+        leftMotor.read_outputs()
+        rightMotor.read_outputs()
+        leftWheelPos  = ENC_RATIO*leftMotor.encoder
+        rightWheelPos = ENC_RATIO*rightMotor.encoder 
+        leftWheelSpd = ENC_RATIO*leftMotor.tach
+        rightWheelSpd = ENC_RATIO*rightMotor.tach
+        #endregion
+
+        #=======================================================================
+        #region: Update scopes & Obstacles
+        #-----------------------------------------------------------------------
+        if sampleCount%4==0:
+            probe.send(name='Motor Position', scopeData=(currentTime, [leftWheelPos, rightWheelPos]))
+            probe.send(name='Motor Velocity', scopeData=(currentTime, [leftWheelSpd, rightWheelSpd]))
+            probe.send(name='Angles', scopeData = (currentTime, [steerError, turnSpdCmd]))
+
+        sensors.read_outputs()
+        TOFMeasurements = (sensors.TOFDistance * sensors.TOFNumberOfTargets).reshape(8,8) 
+        TOFCenterDist = np.mean((TOFMeasurements[3:4,3:4]).flatten())
+        
+        obstacleDetected = obstacle.detect_obstacle(dist = TOFCenterDist, 
+                                                    speed = fwdSpdCmd, 
+                                                    threshold = 0.05)
+        #endregion
+
+        #=======================================================================
+        #region: Image preprocessing and line detection
+        #-----------------------------------------------------------------------
+        newFrame = camera.read()
+        if newFrame:
+            image = camera.imageData
+
+            imageThreshold = vision.hsv_threshold(image,
+                                                    hsvLow=np.array([15,65,150]), 
+                                                    hsvHigh=np.array([40,220,255]))
+            
+            # Offset optimizado
+            y_start = 200
+            y_end = IMAGE_SIZE[1] # 480
+
+            # minArea reducido a 150 para captar pedacitos de linea en las orillas
+            col, row, left, top, width, height = vision.image_find_objects(
+                                                    imageThreshold[y_start:y_end, :], 
+                                                    connectivity = 8, 
+                                                    minArea = 150, 
+                                                    maxArea = 30000)
+        # endregion
+
+            #===================================================================
+            #region: Calculate steering command
+            #-------------------------------------------------------------------
+            
+            if col is not None:
+                # SI HAY LINEA: Reiniciamos el contador de frames perdidos
+                lost_line_frames = 0
+
+                centroid_loc = [int(col), int(row) + y_start]
+                x, y, w, h = left, top + y_start, width, height
+                steerError = vision.centroid_to_steering_error(col, row)
+
+                turnSpdCmd, _, _, _ = line2SpdMap_mdl.send((steerError, 0.5, 0.0, 0.12))
+                
+                # ZIG-ZAG: Frena el avance si la linea esta muy en la orilla para pivotar
+                if abs(steerError) > 260:
+                    fwdSpdCmd = 0.0 
+                else:
+                    # Control Dinamico de Velocidad para rectas
+                    MAX_SPEED = 0.04   
+                    MIN_SPEED = 0.015  
+                    fwdSpdCmd = MAX_SPEED - (abs(steerError) * 0.00015)
+                    fwdSpdCmd = max(MIN_SPEED, min(MAX_SPEED, fwdSpdCmd))
+
+            else:
+                # NO VE LA LINEA: Aumentamos el contador de frames perdidos
+                lost_line_frames += 1
+
+                if lost_line_frames < MAX_LOST_FRAMES:
+                    # VENTANA DE GRACIA (Pico de zig-zag):
+                    # Detiene avance pero sigue pivotando suavemente hacia donde vio la linea
+                    fwdSpdCmd = 0.0
+                    if steerError > 0:
+                        turnSpdCmd = 0.25
+                    elif steerError < 0:
+                        turnSpdCmd = -0.25
+                    _, _, _, _ = line2SpdMap_mdl.send((steerError, 0.5, 0.0, 0.12))
+                else:
+                    # FIN DE LINEA CONFIRMADO: Detencion total
+                    steerError = 0
+                    fwdSpdCmd = 0.0  
+                    turnSpdCmd = 0.0   
+                    _, _, _, _ = line2SpdMap_mdl.send((0, 0.5, 0.0, 0.12))
+            #endregion
+
+            #===================================================================
+            #region: Update displays
+            #-------------------------------------------------------------------
+            # Graficos a 6 FPS (frameCount % 5) para no saturar a la Raspberry Pi
+            if frameCount%5 ==0:
+                
+                if col is not None:
+                    image = display.draw_bounding_box(image,centroid_loc, x,y,w,h)
+                
+                image = display.draw_arrow(image,turnSpdCmd)
+            
+                lcd.draw_image(image)
+                lcd.print_text(f"Steer Error: {steerError:.1f}", 40, 2, setColor=True, rgb = [255,0,0])
+                lcd.print_text(f"Turn Spd: {turnSpdCmd:.1f}", 40, 6, setColor=True, rgb = [0,0,255])
+                lcd.print_text(f"Fwd Spd: {fwdSpdCmd:.3f}", 40, 10, setColor=True, rgb = [0,255,0])
+
+                cv2.waitKey(1)
+            #endregion
+            frameCount += 1
+
+        sampleCount += 1
+        timer.sleep()
+
+cv2.destroyAllWindows()
+probe.terminate()
+
+input ("Press Enter to exit...")
